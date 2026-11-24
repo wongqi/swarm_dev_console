@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "swarm-dev-console"
+version = "0.1.0"
+description = "Local MQTT console for development of swarm missions"
+requires-python = ">=3.10"
+dependencies = ["paho-mqtt>=1.6,<3"]
+
+[project.scripts]
+swarm_dev_console = "swarm_dev_console.server:main"
+
+[tool.setuptools]
+packages = ["swarm_dev_console"]
+
+[tool.setuptools.package-data]
+swarm_dev_console = ["static/*"]
