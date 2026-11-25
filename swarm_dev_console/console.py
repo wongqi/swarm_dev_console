@@ -4,6 +4,7 @@ from collections import deque
 import fcntl
 import json
 import secrets
+import sqlite3
 import threading
 import time
 import uuid
@@ -14,12 +15,11 @@ from .contracts import (HEARTBEAT, IDENTIFIER, MAX_BYTES, MAX_EPOCH, PREFIX,
                         SUBSCRIPTIONS, TERMINAL, WIRE_BYTES, epoch_of, parse,
                         sanitize, validate_task_data)
 from .journal import Journal
-from .reports import atomic_bytes
+from .history import PlanHistory
 
 
 class Console:
-    def __init__(self, root, host, port, *, username=None, password=None, tls=False, ca=None,
-                 legacy_epoch=None):
+    def __init__(self, root, host, port, *, username=None, password=None, tls=False, ca=None):
         self.root = root
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.process_lock = (root / "console.lock").open("a")
@@ -29,16 +29,14 @@ class Console:
             self.process_lock.close()
             raise ValueError("已有调试台使用此数据目录") from None
         self.lock = threading.RLock()
-        self.epoch_path = root / "epoch"
         try:
-            if not self.epoch_path.exists() and legacy_epoch is not None and legacy_epoch.is_file():
-                atomic_bytes(self.epoch_path, legacy_epoch.read_bytes())
-            self.epoch = int(self.epoch_path.read_text()) if self.epoch_path.exists() else 0
-        except (ValueError, OSError):
+            self.history = PlanHistory(root / "plans.sqlite3")
+        except (sqlite3.Error, OSError):
             self.process_lock.close()
             raise
         self.journal = Journal(root / "mqtt")
         self.devices, self.mission, self.plan, self.requests = {}, None, None, {}
+        self.plan = self.history.latest()
         self.events = deque(maxlen=250)
         self.raw = deque(maxlen=400)
         self.raw_bytes = 0
@@ -66,6 +64,7 @@ class Console:
         self.client.disconnect()
         self.client.loop_stop()
         self.journal.close()
+        self.history.close()
         self.process_lock.close()
 
     def on_connect(self, client, _data, _flags, result):
@@ -120,7 +119,6 @@ class Console:
             self.topics.setdefault(topic, {"count": 0})["count"] += 1
             self.topics[topic]["last_received"] = now
             epoch = epoch_of(data)
-            self.epoch = max(self.epoch, epoch)
             if topic.startswith(HEARTBEAT + "/"):
                 robot = topic.split("/")[-2]
                 if robot != value.get("robot_id") or not IDENTIFIER.fullmatch(robot):
@@ -147,6 +145,11 @@ class Console:
                 self.events.append(raw)
                 stage = data.get("stage")
                 if stage == "for_platform_task_plan":
+                    try:
+                        self.history.record(data, now)
+                    except (sqlite3.Error, OSError) as error:
+                        self.journal.log.warning("分配历史保存失败：%s", error)
+                        self.seen.pop(event_id, None)  # allow the next replay to repair local storage
                     if self.plan is None or self.plan_order(data) >= self.plan_order(self.plan):
                         self.plan = {**data, "message_id": raw["id"]}
                 if stage == "for_platform_mission_finished" and data.get("state") in TERMINAL:
@@ -175,13 +178,10 @@ class Console:
             self.mission = {**data, "received_at": now}
 
     def new_epoch(self):
-        with self.lock:
-            epoch = max(self.epoch + 1, time.time_ns() // 1_000_000)
-            if epoch > MAX_EPOCH:
-                raise ValueError("轮次号已达到安全整数上限")
-            atomic_bytes(self.epoch_path, str(epoch).encode())
-            self.epoch = epoch
-            return epoch
+        epoch = time.time_ns() // 1_000_000
+        if not 0 < epoch <= MAX_EPOCH:
+            raise ValueError("系统时间无法生成有效的毫秒轮次")
+        return epoch
 
     def send(self, payload):
         method, bid, data = payload.get("method"), payload.get("bid"), payload.get("data")
@@ -208,7 +208,6 @@ class Console:
             info = self.client.publish(PREFIX + "/services", body, qos=1, retain=False)
             if info.rc != mqtt.MQTT_ERR_SUCCESS:
                 raise ValueError("MQTT 发布队列不可用")
-            self.epoch = max(self.epoch, data["round_epoch"])
             status = {"bid": bid, "tid": tid, "method": method, "round_epoch": data["round_epoch"],
                       "status": "已交给 MQTT 队列"}
             self.journal.record("out", {"topic": PREFIX + "/services", "payload": sanitize(envelope)})
@@ -223,6 +222,7 @@ class Console:
                      "devices": list(self.devices.values()), "mission": self.mission, "plan": self.plan,
                      "events": list(self.events), "requests": list(self.requests.values()),
                      "connection_result": self.connection_result, "journal_dropped": self.journal.dropped,
+                     "history_version": self.history.version, "rounds": self.history.rounds(),
                      "topics": {topic: stats.copy() for topic, stats in self.topics.items()},
                      "subscriptions": self.subscriptions.copy()}
             if compact:

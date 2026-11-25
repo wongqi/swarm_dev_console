@@ -7,7 +7,7 @@ name = "swarm-dev-console"
 version = "0.1.0"
 description = "Local MQTT console for development of swarm missions"
 requires-python = ">=3.10"
-dependencies = ["paho-mqtt>=1.6,<3"]
+dependencies = ["paho-mqtt>=1.6,<3", "PyYAML>=6", "Pillow>=9"]
 
 [project.scripts]
 swarm_dev_console = "swarm_dev_console.server:main"

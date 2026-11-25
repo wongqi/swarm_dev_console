@@ -37,19 +37,24 @@ const hubStates = {
 const roles = { leader: "Leader", follower: "Follower", candidate: "候选" };
 const terminal = ["COMPLETED", "FAILED", "CANCELLED"];
 const format = (value) => JSON.stringify(value, null, 2);
-const clock = (seconds) => seconds == null ? "—" : new Date(seconds * 1000).toLocaleTimeString();
+const clock = (seconds) => seconds == null ? "—" : new Date(seconds * 1000).toLocaleTimeString("zh-CN", { hour12: false });
 const age = (now, received) => (Math.max(0, now - received)).toFixed(1) + " s";
 const jsonMethod = (method) => ["task.execute", "task.add"].includes(method);
 const showValue = (value) => value == null || value === "" ? "—" : String(value);
 const list = (values) => Array.isArray(values) && values.length ? values.join("、") : "—";
 let current = null;
-let selected = null;
 let events = [];
 let wire = [];
 let frozen = false;
 let wireLoading = false;
 let inspectedMessage = 0;
 const signatures = new Map();
+const mapView = new SwarmMap();
+const allocation = new AllocationView(mapView);
+const taskRequest = new TaskRequest({
+    onDraft: (data) => allocation.draft(data),
+    onPublished: (payload) => allocation.published(payload),
+});
 
 function node(tag, content, className = "") {
     const result = document.createElement(tag);
@@ -133,7 +138,7 @@ function renderOverview(state) {
     const stale = current && !terminal.includes(current.state) &&
         (!state.connected || state.time - current.received_at >= 5);
     $("mission").textContent = current ?
-        [current.mission_id, "轮次 " + current.round_epoch, "修订 " + current.plan_revision,
+        ["任务 " + current.mission_id, String(current.mission_id) !== String(current.round_epoch) ? "轮次 " + current.round_epoch : "", "修订 R" + current.plan_revision,
         stale ? "状态更新超时" : "", "最近接收 " + clock(current.received_at)].filter(Boolean).join(" · ") :
         "等待任务状态";
     const values = [
@@ -148,6 +153,13 @@ function renderOverview(state) {
     $("detail").textContent = [current?.map_package, current?.message,
     current?.report_key && "报告 key " + current.report_key].filter(Boolean).join(" · ");
     if ($("state-detail").open) $("state-json").textContent = current ? format(current) : "等待任务状态";
+    const exceptions = [["导航跳过", current?.skipped_tasks], ["结果未确认", current?.unconfirmed_tasks], ["能力不匹配", current?.unassignable_tasks]]
+        .filter(([, data]) => data && Object.keys(data).length);
+    renderIfChanged("exceptions", exceptions, () => exceptions.map(([title, data]) => {
+        const part = node("dl");
+        part.append(node("dt", title), node("dd", reasonList(data)));
+        return part;
+    }));
 }
 
 function renderDevices(state) {
@@ -203,23 +215,6 @@ function reasonList(value) {
         [item.task_id, item.reason].filter(Boolean).join(" · ") : String(item)).join("、");
     return Object.entries(value).map(([id, reason]) =>
         id + (typeof reason === "string" ? " · " + reason : reason?.reason ? " · " + reason.reason : "")).join("、");
-}
-
-function renderAllocation(state) {
-    const plan = state.plan?.round_epoch === current?.round_epoch ? state.plan : null;
-    $("plan-label").textContent = plan ? "最近收到的计划修订 " + showValue(plan.plan_revision) : "等待本轮计划事件";
-    $("plan-json").hidden = !plan?.message_id;
-    $("plan-json").onclick = () => inspectMessage(plan.message_id, "完整计划 JSON");
-    const routes = plan?.routes ?? [];
-    renderIfChanged("routes", routes, () => routes.length ? routes.map((route) =>
-        row([route.robot_id, cell((route.task_ids?.length ?? 0) + " 个", [list(route.task_ids)]),
-        route.checkpoint_count, list(route.dependencies)])) : [emptyRow(4, "暂无分配数据")]);
-    const exceptions = [["导航跳过", current?.skipped_tasks], ["结果未确认", current?.unconfirmed_tasks], ["能力不匹配", current?.unassignable_tasks]];
-    renderIfChanged("exceptions", exceptions, () => current ? exceptions.map(([title, data]) => {
-        const part = node("dl");
-        part.append(node("dt", title), node("dd", reasonList(data)));
-        return part;
-    }) : []);
 }
 
 function renderEvents() {
@@ -294,7 +289,8 @@ function render(state) {
     $("broker").className = "badge " + (state.connected ? "good" : rejection ? "bad" : "warn");
     renderOverview(state);
     renderDevices(state);
-    renderAllocation(state);
+    allocation.update(state);
+    taskRequest.update(state);
     const requests = state.requests.map((request) => ({
         ...request, method: methods[request.method] ?? request.method,
     }));
@@ -326,79 +322,7 @@ $("freeze").addEventListener("click", () => {
     $("freeze").textContent = frozen ? "恢复消息刷新" : "暂停消息刷新";
     if (!frozen) refreshWire().catch(() => { });
 });
-$("method").addEventListener("change", () => {
-    const method = $("method").value;
-    $("json-fields").hidden = !jsonMethod(method);
-    $("epoch-field").hidden = jsonMethod(method);
-    $("new-epoch").hidden = method !== "task.execute";
-    if (method !== "task.execute" && current) {
-        $("bid").value = current.mission_id;
-        $("epoch").value = current.round_epoch;
-    }
-});
 $("filter").addEventListener("input", renderEvents);
-$("file").addEventListener("change", async () => {
-    const file = $("file").files[0];
-    if (file) $("data").value = await file.text();
-});
-$("new-epoch").addEventListener("click", async () => {
-    try {
-        const data = JSON.parse($("data").value);
-        if (!data || Array.isArray(data) || typeof data !== "object") throw new Error("请先导入或填写任务 JSON");
-        const session = await (await fetch("/api/session")).json();
-        const response = await fetch("/api/epoch", {
-            method: "POST",
-            headers: { "Content-Type": "application/json", "X-Swarm-Session": session.token },
-            body: "{}"
-        });
-        const result = await response.json();
-        if (!response.ok) throw new Error(result.error || "轮次生成失败");
-        data.round_epoch = result.round_epoch;
-        $("data").value = format(data);
-        $("result").textContent = "已更新编辑区的 round_epoch，请预览后发送。";
-    } catch (error) {
-        $("result").textContent = error.message;
-    }
-});
-$("request").addEventListener("submit", (event) => {
-    event.preventDefault();
-    const method = $("method").value;
-    try {
-        const data = jsonMethod(method) ? JSON.parse($("data").value) : {};
-        if (!data || Array.isArray(data) || typeof data !== "object") throw new Error("任务 JSON 需要对象");
-        if (!jsonMethod(method)) {
-            data.round_epoch = Number($("epoch").value);
-            if (!Number.isSafeInteger(data.round_epoch) || data.round_epoch < 1) throw new Error("请填写有效轮次");
-        }
-        if (!Number.isSafeInteger(data.round_epoch) || data.round_epoch < 1) {
-            throw new Error("任务 JSON 需要有效的 round_epoch");
-        }
-        selected = { bid: $("bid").value, method, data };
-        $("preview").textContent = format(selected);
-        $("review").showModal();
-    } catch (error) {
-        $("result").textContent = error.message;
-    }
-});
-$("dismiss").addEventListener("click", () => $("review").close());
-$("send").addEventListener("click", async () => {
-    $("send").disabled = true;
-    try {
-        const session = await (await fetch("/api/session")).json();
-        const response = await fetch("/api/request", {
-            method: "POST",
-            headers: { "Content-Type": "application/json", "X-Swarm-Session": session.token },
-            body: JSON.stringify(selected)
-        });
-        const result = await response.json();
-        $("result").textContent = result.error || result.status + " · " + result.round_epoch;
-        $("review").close();
-    } catch (error) {
-        $("result").textContent = error.message;
-    } finally {
-        $("send").disabled = false;
-    }
-});
 let replay = [];
 
 function showReport(url) {

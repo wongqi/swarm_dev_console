@@ -19,6 +19,7 @@ from paho.mqtt import client as mqtt
 
 from swarm_dev_console.console import Console
 from swarm_dev_console.contracts import PREFIX
+from swarm_dev_console.maps import MapLibrary
 from swarm_dev_console.reports import EvidenceLibrary, ReportReader
 from swarm_dev_console.server import Handler, ThreadingHTTPServer
 
@@ -84,6 +85,8 @@ def local_broker(tmp_path):
 
 
 def test_console_http_and_mqtt(tmp_path, monkeypatch):
+    generated_ms = 1795513654008
+    monkeypatch.setattr("swarm_dev_console.console.time.time_ns", lambda: generated_ms * 1_000_000)
     with local_broker(tmp_path) as port:
         peer = mqtt.Client(client_id="console-test-peer")
         messages, ready = [], []
@@ -104,6 +107,7 @@ def test_console_http_and_mqtt(tmp_path, monkeypatch):
             monkeypatch.setattr(console.client, "publish", track_publish)
             server.library = EvidenceLibrary(tmp_path / "data" / "archives")
             server.reports = ReportReader(tmp_path / "data" / "reports")
+            server.maps = MapLibrary(tmp_path / "maps")
             thread = Thread(target=server.serve_forever)
             thread.start()
             address = "http://127.0.0.1:" + str(server.server_port)
@@ -116,8 +120,9 @@ def test_console_http_and_mqtt(tmp_path, monkeypatch):
                 until(lambda: ready and api("/api/state")["subscriptions"].get(PREFIX + "/services") == 1)
                 with urlopen(address, timeout=2) as response:
                     page = response.read().decode()
-                    assert "Swarm 协同调试台" in page
-                    assert 'id="new-epoch"' in page and 'id="file"' in page
+                    assert "多机协同调试台" in page
+                    assert 'id="new-task"' in page and 'id="file"' in page
+                    assert 'id="bid"' not in page and 'id="new-epoch"' not in page
                     assert 'class="side-nav"' not in page
                     assert "company2" not in page
                 with pytest.raises(HTTPError, match="404"):
@@ -158,13 +163,13 @@ def test_console_http_and_mqtt(tmp_path, monkeypatch):
                                         data=b"{}")
                 with urlopen(epoch_request, timeout=2) as response:
                     generated = json.load(response)["round_epoch"]
-                assert generated > data["round_epoch"]
+                assert generated == generated_ms
                 assert not messages
                 sent = send("task.execute", data)
                 epoch = sent["round_epoch"]
                 until(lambda: messages)
                 assert epoch == 101 and messages[0]["data"] == data
-                assert int((tmp_path / "data" / "epoch").read_text()) == generated
+                assert not (tmp_path / "data" / "epoch").exists()
 
                 for i, method in enumerate(("task.add", "task.stop", "task.reset"), start=2):
                     send(method, {**data, "round_epoch": epoch})
@@ -204,10 +209,38 @@ def test_console_http_and_mqtt(tmp_path, monkeypatch):
                 assert sum(r["stage"] == "for_platform_mission_finished" for r in snapshot["events"]) == 1
                 assert "must-not-leak" not in json.dumps(api("/api/evidence"))
                 compact = api("/api/state?compact=1")
+                assert compact["history_version"] == 2
+                assert compact["rounds"][0]["revisions"] == 2
+                assert [p["plan_revision"] for p in api("/api/plans?epoch=101")] == [1, 2]
+                assert api("/api/plans?epoch=101&revision=2")["routes"] == routes
+                with pytest.raises(HTTPError, match="404"):
+                    api("/api/plans?epoch=101&revision=3")
+                with pytest.raises(HTTPError, match="400"):
+                    api("/api/plans?epoch=../outside")
                 assert compact["devices"][0]["pose"]["frame_id"] == "map_000"
                 assert compact["plan"]["plan_revision"] == 2
                 assert compact["plan"]["routes"][0]["checkpoint_count"] == 1
                 assert compact["topics"][PREFIX + "/services"]["count"] == 4
+                # Local map reads and a new epoch after another entry point's
+                # newer heartbeat must neither publish control nor advance the clock.
+                from PIL import Image
+                local_map = tmp_path / "maps" / "test"
+                local_map.mkdir(parents=True)
+                Image.new("L", (20, 10), 255).save(local_map / "map_000.png")
+                (local_map / "map_000.yaml").write_text(
+                    "image: map_000.png\nresolution: 0.5\norigin: [1, 2, 0]\n")
+                maps = api("/api/maps?package=/board/maps/test")
+                assert maps["maps"][0]["width"] == 20
+                with urlopen(address + "/api/maps/image?package=/board/maps/test&file=map_000.yaml", timeout=2) as response:
+                    assert response.headers["Content-Type"] == "image/png"
+                    assert response.read().startswith(b"\x89PNG")
+                publish("fh/swarm/device/R2/heartbeat", {
+                    "robot_id": "R2", "round_epoch": generated + 1000, "sequence": 1,
+                })
+                until(lambda: any(d["robot_id"] == "R2" and d["round_epoch"] == generated + 1000
+                                  for d in api("/api/state")["devices"]))
+                with urlopen(epoch_request, timeout=2) as response:
+                    assert json.load(response)["round_epoch"] == generated_ms
                 plan_message = api(f"/api/messages?id={compact['plan']['message_id']}")
                 assert plan_message["payload"]["data"]["routes"]["R1"]["checkpoints"] == routes["R1"]["checkpoints"]
                 wire = api("/api/messages")
@@ -215,7 +248,7 @@ def test_console_http_and_mqtt(tmp_path, monkeypatch):
                 assert all("payload" not in row for row in wire)
                 assert {row["topic"] for row in wire} == {
                     PREFIX + "/services", PREFIX + "/services_reply", PREFIX + "/events",
-                    PREFIX + "/state", "fh/swarm/device/R1/heartbeat",
+                    PREFIX + "/state", "fh/swarm/device/R1/heartbeat", "fh/swarm/device/R2/heartbeat",
                 }
                 for _ in range(3):
                     api("/api/state?compact=1")

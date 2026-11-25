@@ -11,6 +11,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from .console import Console
 from .contracts import MAX_BYTES, parse
+from .maps import MapLibrary
 from .reports import ARCHIVE_LIMIT, EvidenceLibrary, ReportReader, ReportUnavailable
 
 
@@ -55,10 +56,34 @@ class Handler(BaseHTTPRequestHandler):
             if message is None:
                 return self.json(404, {"error": "该消息已移出最近记录"})
             return self.json(200, message)
+        if path == "/api/plans":
+            try:
+                epoch = int(params.get("epoch", ["0"])[0])
+                if not 0 < epoch <= 2**53 - 1:
+                    raise ValueError
+                revision = params.get("revision", [None])[0]
+                if revision is None:
+                    return self.json(200, self.server.console.history.index(epoch))
+                revision = int(revision)
+                if not 0 < revision <= 2**53 - 1:
+                    raise ValueError
+                plan = self.server.console.history.get(epoch, revision)
+                return self.json(200, plan) if plan else self.json(404, {"error": "未接收到该修订的分配结果"})
+            except ValueError:
+                return self.json(400, {"error": "轮次或修订无效"})
         if path == "/api/session":
             return self.json(200, {"token": self.server.console.token})
         if path == "/api/evidence":
             return self.json(200, self.server.console.snapshot(wire=True), attachment=True)
+        if path in {"/api/maps", "/api/maps/image"}:
+            try:
+                library = self.server.maps
+                package = params.get("package", [""])[0]
+                if path == "/api/maps":
+                    return self.json(200, library.metadata(package))
+                return self.response(200, library.image(package, params.get("file", [""])[0]), "image/png")
+            except (ValueError, OSError) as error:
+                return self.json(400, {"error": str(error)})
         if path in {"/api/report", "/api/archive", "/api/archive/file"}:
             try:
                 if path == "/api/archive":
@@ -79,7 +104,10 @@ class Handler(BaseHTTPRequestHandler):
                     return self.response(error.status, raw, "text/html; charset=utf-8", report=True)
                 return self.json(error.status, {"error": str(error)})
         assets = {"/": ("index.html", "text/html"), "/style.css": ("style.css", "text/css"),
-                  "/console.js": ("console.js", "text/javascript")}
+                  "/console.js": ("console.js", "text/javascript"),
+                  "/task-request.js": ("task-request.js", "text/javascript"),
+                  "/allocation-view.js": ("allocation-view.js", "text/javascript"),
+                  "/map-view.js": ("map-view.js", "text/javascript")}
         if path not in assets:
             return self.json(404, {"error": "页面不存在"})
         name, content_type = assets[path]
@@ -126,20 +154,20 @@ def main():
     parser.add_argument("--mqtt-ca")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--data-root", type=Path, default=default_root())
+    parser.add_argument("--maps-root", type=Path, default=Path(__file__).resolve().parents[1] / "maps")
     parser.add_argument("--report-endpoint", default=os.environ.get("SWARM_REPORT_ENDPOINT"))
     parser.add_argument("--report-bucket", default=os.environ.get("SWARM_REPORT_BUCKET"))
     parser.add_argument("--report-prefix", default=os.environ.get("SWARM_REPORT_PREFIX", ""))
     args = parser.parse_args()
-    legacy_epoch = Path.home() / ".swarm-dev-console/epoch"
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     try:
         server.console = Console(args.data_root, args.mqtt_host, args.mqtt_port,
                                  username=os.environ.get("SWARM_MQTT_USER"),
                                  password=os.environ.get("SWARM_MQTT_PASSWORD"),
-                                 tls=args.mqtt_tls, ca=args.mqtt_ca,
-                                 legacy_epoch=legacy_epoch if args.data_root == default_root() else None)
+                                 tls=args.mqtt_tls, ca=args.mqtt_ca)
         server.reports = ReportReader(args.data_root / "reports", args.report_endpoint,
                                       args.report_bucket, args.report_prefix)
+        server.maps = MapLibrary(args.maps_root)
         server.library = EvidenceLibrary(args.data_root / "archives")
         print(f"Swarm 调试台 http://127.0.0.1:{server.server_port}", flush=True)
         server.serve_forever()
